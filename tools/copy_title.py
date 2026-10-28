@@ -53,6 +53,41 @@ def anidap_json(url):
         except Exception: time.sleep(3)
     return None
 
+def parse_variant(master, stream_url, ref):
+    """Pilih varian bandwidth tertinggi; kembalikan (teks_playlist, url_dasar, daftar_segmen)."""
+    lines = [l.strip() for l in master.splitlines() if l.strip()]
+    best, bestbw = None, -1
+    for i, l in enumerate(lines):
+        if l.startswith('#EXT-X-STREAM-INF'):
+            bw = 0
+            for part in l.split(','):
+                if part.strip().startswith('BANDWIDTH='): bw = int(part.strip().split('=')[1])
+            nxt = lines[i + 1] if i + 1 < len(lines) else None
+            if nxt and not nxt.startswith('#') and bw > bestbw: bestbw, best = bw, nxt
+    if best is None:
+        pl, pl_base = master, stream_url
+    else:
+        v_abs = resolve_ref(stream_url, best)
+        pl, _ = fetch_playlist(v_abs, ref)
+        if not pl: return None
+        pl_base = v_abs
+    durs, segs = [], []
+    pending = None
+    for l in pl.splitlines():
+        l = l.strip()
+        if l.startswith('#EXTINF'): pending = float(l.split(':')[1].rstrip(','))
+        elif l and not l.startswith('#'):
+            durs.append(pending or 0.0); segs.append(l)
+    if not segs: return None
+    return (pl, pl_base, durs, segs)
+
+def fetch_segment(s_abs, ref):
+    if s_abs.startswith(WORKER): return curl_bytes(s_abs, tries=2)
+    data = curl_bytes(s_abs, tries=2)
+    if is_ts(data): return data
+    alt = curl_bytes(prox(s_abs, ref))
+    return alt if is_ts(alt) else data
+
 def resolve_source(slug_id, num):
     srv = anidap_json(f'https://chad.anidap.lol/rest/api/servers?id={urllib.parse.quote(slug_id)}&epNum={num}')
     if not srv: return None
@@ -67,8 +102,19 @@ def resolve_source(slug_id, num):
     cands.sort(key=lambda c: 0 if 'nexabloom' in c[0] else 1)
     for u, ref in cands:
         raw = curl_bytes(prox(u, ref), tries=2)
-        if raw and raw.decode('utf-8', 'replace').lstrip().startswith('#EXTM3U'):
-            return (u, ref)
+        if not raw or not raw.decode('utf-8', 'replace').lstrip().startswith('#EXTM3U'):
+            continue
+        master = raw.decode('utf-8', 'replace')
+        parsed = parse_variant(master, u, ref)
+        if not parsed: continue
+        pl, pl_base, durs, segs = parsed
+        # Uji segmen pertama & tengah: kandidat hanya diterima bila segmennya
+        # benar-benar bisa diambil (playlist saja tidak cukup — kasus AoT).
+        ok = True
+        for idx in {0, len(segs) // 2}:
+            s_abs = resolve_ref(pl_base, segs[idx])
+            if not is_ts(fetch_segment(s_abs, ref)): ok = False; break
+        if ok: return (pl, pl_base, durs, segs, ref)
     return None
 
 def fetch_playlist(url, ref):
@@ -92,57 +138,15 @@ def download_episode(slug_id, num, outdir):
         if got: break
         log(f'  ep{num}: resolusi kosong (coba {attempt + 1}/3)'); time.sleep(10)
     if not got: return False
-    stream_url, referer = got
+    pl, pl_base, durs, segs, referer = got
     os.makedirs(outdir, exist_ok=True)
-    master, _ = fetch_playlist(stream_url, referer)
-    if not master: return False
-    lines = [l.strip() for l in master.splitlines() if l.strip()]
-    best, bestbw = None, -1
-    for i, l in enumerate(lines):
-        if l.startswith('#EXT-X-STREAM-INF'):
-            bw = 0
-            for part in l.split(','):
-                if part.strip().startswith('BANDWIDTH='): bw = int(part.strip().split('=')[1])
-            nxt = lines[i + 1] if i + 1 < len(lines) else None
-            if nxt and not nxt.startswith('#') and bw > bestbw: bestbw, best = bw, nxt
-    if best is None:
-        pl, pl_base = master, stream_url
-    else:
-        v_abs = resolve_ref(stream_url, best)
-        pl, _ = fetch_playlist(v_abs, referer)
-        if not pl: return False
-        pl_base = v_abs
-    durs, segs = [], []
-    pending = None
-    for l in pl.splitlines():
-        l = l.strip()
-        if l.startswith('#EXTINF'): pending = float(l.split(':')[1].rstrip(','))
-        elif l and not l.startswith('#'):
-            durs.append(pending or 0.0); segs.append(l)
-    if not segs: return False
     def grab(i):
         path = os.path.join(outdir, f'seg-{i:03d}.ts')
         if os.path.exists(path) and os.path.getsize(path) > 0:
             with open(path, 'rb') as f: head = f.read(1)
             if head == b'\x47': return True
         s_abs = resolve_ref(pl_base, segs[i])
-        if s_abs.startswith(WORKER):
-            data = curl_bytes(s_abs)
-        elif DIRECT_OK['v'] is False:
-            data = curl_bytes(prox(s_abs, referer))
-        else:
-            data = curl_bytes(s_abs, tries=2)
-            if not is_ts(data):
-                alt = curl_bytes(prox(s_abs, referer))
-                if is_ts(alt):
-                    if DIRECT_OK['v'] is None: DIRECT_OK['v'] = False
-                    data = alt
-                elif is_ts(data):
-                    pass
-                else:
-                    data = alt if is_ts(alt) else data
-            elif DIRECT_OK['v'] is None:
-                DIRECT_OK['v'] = True
+        data = fetch_segment(s_abs, referer)
         if not is_ts(data): return False
         with open(path, 'wb') as f: f.write(data)
         return True
